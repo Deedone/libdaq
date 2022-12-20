@@ -58,6 +58,10 @@
 #include <linux/nexthop.h>
 #include <stddef.h>
 #include <ctype.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/socket.h>
+#include <linux/sockios.h>
 
 #define DAQ_MOD_VERSION  (1)
 #define DAQ_TYPE (DAQ_TYPE_INTF_CAPABLE | DAQ_TYPE_INLINE_CAPABLE | \
@@ -77,6 +81,8 @@
 #ifndef __aligned
 #define __aligned(x)		__attribute__((aligned(x)))
 #endif
+
+#define L fprintf(stderr, "%s:%d\n", __func__, __LINE__)
 
 #define hlist_for_each(pos, head) \
 	for (pos = (head)->first; pos ; pos = pos->next)
@@ -159,13 +165,14 @@ struct blacklist_data {
 struct rswitch_context {
 	unsigned snaplen;
 	char error[DAQ_ERRBUF_SIZE];
+	int cnt;
 
 	DAQ_State state;
 	DAQ_Stats_t stats;
 	DAQ_Analysis_Func_t analysis_func;
 
+	pcap_handler callback;
 	pcap_t *handle;
-	pcap_t *mon_handle;
 	int packets;
 	char *device;
 	int promisc_flag;
@@ -174,6 +181,16 @@ struct rswitch_context {
 	u_char *user_data;
 	uint32_t netmask;
 	struct list_head blacklist;
+	pthread_t thread;
+	atomic_int stop;
+	uint8_t ether_addr[6];
+};
+
+#define TSN_NUM 3
+struct rswitch_handle {
+
+	struct rswitch_context contexts[TSN_NUM];
+	struct rswitch_context mon_context;
 };
 
 struct rtnl_handle {
@@ -230,6 +247,8 @@ static struct hlist_head name_head[IDXMAP_SIZE];
 static int rcvbuf = 1024 * 1024;
 static struct rtnl_handle rth;
 static struct filter_prefs prefs_before, prefs_after;
+
+static void blacklist_traffic(struct ip_v4_hdr *ip_hdr, struct rswitch_context *context);
 
 static inline void INIT_LIST_HEAD(struct list_head *list)
 {
@@ -587,6 +606,27 @@ static int addattr_nest_end(struct nlmsghdr *n, struct rtattr *nest)
 {
 	nest->rta_len = (void *)NLMSG_TAIL(n) - (void *)nest;
 	return n->nlmsg_len;
+}
+
+int get_eth_addr(char *ifname, char eth_addr[6]) {
+
+  struct ifreq ifr;
+  int sock;
+
+
+  sock=socket(AF_INET,SOCK_DGRAM,0);
+  strcpy( ifr.ifr_name, ifname );
+  ifr.ifr_addr.sa_family = AF_INET;
+
+  if (ioctl( sock, SIOCGIFHWADDR, &ifr ) < 0) {
+    return -1;
+  }
+
+  memcpy(eth_addr, ifr.ifr_hwaddr.sa_data, 6);
+  close(sock);
+
+  return 0;
+
 }
 
 static int pack_key(struct tc_u32_sel *sel, uint32_t key, uint32_t mask,
@@ -1254,7 +1294,7 @@ static unsigned ll_name_to_index(const char *name)
 	return idx;
 }
 
-static int pcap_daq_open(struct rswitch_context *context, const char *device, pcap_t **handle)
+static int pcap_daq_open(struct rswitch_context *context, const char *device)
 {
 	uint32_t localnet, netmask;
 	uint32_t defaultnet = 0xFFFFFF00;
@@ -1262,28 +1302,29 @@ static int pcap_daq_open(struct rswitch_context *context, const char *device, pc
 	int status;
 #endif /* PCAP_OLDSTYLE */
 
-	if (*handle)
+	if (context->handle)
 		return DAQ_SUCCESS;
 
 	if (context->device) {
 #ifndef PCAP_OLDSTYLE
-		*handle = pcap_create(device, context->error);
-		if (!*handle)
+		fprintf(stderr, "pcap_daq_open: device = %s context %x\n", device, context);
+		context->handle = pcap_create(device, context->error);
+		if (!context->handle)
 			return DAQ_ERROR;
-		if ((status = pcap_set_snaplen(*handle, context->snaplen)) < 0)
+		if ((status = pcap_set_snaplen(context->handle, context->snaplen)) < 0)
 			goto fail;
-		if ((status = pcap_set_promisc(*handle, context->promisc_flag ? 1 : 0)) < 0)
+		if ((status = pcap_set_promisc(context->handle, context->promisc_flag ? 1 : 0)) < 0)
 			goto fail;
-		if ((status = pcap_set_timeout(*handle, context->timeout)) < 0)
+		if ((status = pcap_set_timeout(context->handle, context->timeout)) < 0)
 			goto fail;
-		if ((status = pcap_set_buffer_size(*handle, context->buffer_size)) < 0)
+		if ((status = pcap_set_buffer_size(context->handle, context->buffer_size)) < 0)
 			goto fail;
-		if ((status = pcap_activate(*handle)) < 0)
+		if ((status = pcap_activate(context->handle)) < 0)
 			goto fail;
 #else
-		*handle = pcap_open_live(device, context->snaplen,
+		context->handle = pcap_open_live(device, context->snaplen,
 										 context->promisc_flag ? 1 : 0, context->timeout, context->error);
-		if (!*handle)
+		if (!context->handle)
 			return DAQ_ERROR;
 #endif /* PCAP_OLDSTYLE */
 		if (pcap_lookupnet(device, &localnet, &netmask, context->error) < 0)
@@ -1296,49 +1337,163 @@ static int pcap_daq_open(struct rswitch_context *context, const char *device, pc
 #ifndef PCAP_OLDSTYLE
 fail:
 	if (status == PCAP_ERROR || status == PCAP_ERROR_NO_SUCH_DEVICE || status == PCAP_ERROR_PERM_DENIED)
-		DPE(context->error, "%s", pcap_geterr(*handle));
+		DPE(context->error, "%s", pcap_geterr(context->handle));
 	else
 		DPE(context->error, "%s: %s", context->device, pcap_statustostr(status));
-	pcap_close(*handle);
-	*handle = NULL;
+	pcap_close(context->handle);
+	context->handle = NULL;
 	return DAQ_ERROR;
 #endif /* PCAP_OLDSTYLE */
+}
+
+static void pcap_process_mon_loop(u_char *user, const struct pcap_pkthdr *pkth, const u_char *data)
+{
+	struct rswitch_context *context = (struct rswitch_context *) user;
+	struct rswitch_handle *handle = container_of(context, struct rswitch_handle, mon_context);
+	struct ip_v4_hdr *ip_hdr;
+
+	ip_hdr = (struct ip_v4_hdr *)data;
+
+	fprintf(stderr, "MON LOOP MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+		ip_hdr->ether_hdr.ether_dst[0], ip_hdr->ether_hdr.ether_dst[1], ip_hdr->ether_hdr.ether_dst[2],
+		ip_hdr->ether_hdr.ether_dst[3], ip_hdr->ether_hdr.ether_dst[4], ip_hdr->ether_hdr.ether_dst[5]);
+
+	// print mac
+
+}
+static void pcap_process_loop(u_char *user, const struct pcap_pkthdr *pkth, const u_char *data)
+{
+	struct rswitch_context *context = (struct rswitch_context *) user;
+	DAQ_PktHdr_t hdr = { 0 };
+	DAQ_Verdict verdict;
+	struct ip_v4_hdr *ip_hdr;
+
+	hdr.caplen = pkth->caplen;
+	hdr.pktlen = pkth->len;
+	hdr.ts = pkth->ts;
+	hdr.ingress_index = -1;
+	hdr.egress_index = -1;
+	hdr.ingress_group = -1;
+	hdr.egress_group = -1;
+	hdr.flags = 0;
+	hdr.address_space_id = 0;
+	ip_hdr = (struct ip_v4_hdr *)data;
+
+	/* Increment the current acquire loop's packet counter. */
+	context->packets++;
+	/* ...and then the module instance's packet counter. */
+	context->stats.packets_received++;
+	verdict = context->analysis_func(context->user_data, &hdr, data);
+
+	if (verdict >= MAX_DAQ_VERDICT)
+		verdict = DAQ_VERDICT_PASS;
+	if (verdict == DAQ_VERDICT_BLACKLIST)
+		blacklist_traffic(ip_hdr, context);
+	context->stats.verdicts[verdict]++;
+}
+
+void* acquire_loop(void *data)
+{
+	struct rswitch_context *context = (struct rswitch_context *)data;
+	int cnt;
+	int ret;
+
+	fprintf(stderr, "Thread initialized... %s\n", context->device);
+	//wait for start
+	while(context->stop == 1)
+	{}
+	cnt = context->cnt;
+	fprintf(stderr, "Thread started... %s cnt %d\n", context->device, cnt);
+
+	while ((context->stop == 0) && (context->packets < cnt || cnt <= 0)) {
+		fprintf(stderr, "Dispatching... %s\n", context->device);
+
+		ret = pcap_dispatch(
+			context->handle, (cnt <= 0) ? -1 : cnt - context->packets, context->callback, (void *)context);
+		fprintf(stderr, "pcap_dispatch returned %d dev %s\n", ret, context->device);
+		if (ret == -1) {
+			DPE(context->error, "%s", pcap_geterr(context->handle));
+			return ret;
+		}
+		/* If we hit a breakloop call or timed out without reading any packets, break out. */
+		else if (ret == -2 || ret == 0)
+			break;
+	}
+	fprintf(stderr, "Thread finished...(INSIDE) %s\n", context->device);
+	L;
+
+	return 0;
 }
 
 static int rswitch_daq_initialize(
 	const DAQ_Config_t* cfg, void** handle, char* errBuf, size_t errMax)
 {
-	struct rswitch_context* context = calloc(1, sizeof(*context));
+	struct rswitch_handle* rswitch_handle = calloc(1, sizeof(*rswitch_handle));
+	struct rswitch_context* context;
+	char *devname;
+	int i = 0;
 
-	if (!context) {
+	L;
+	fprintf(stderr, "INITIALIZE!!!!!!!! \n");
+	if (!rswitch_handle) {
 		snprintf(errBuf, errMax, "%s: failed to allocate the R-Switch context!",
 			__func__);
 		return DAQ_ERROR_NOMEM;
 	}
 
-	context->device = strdup(cfg->name);
-	if (!context->device) {
-		snprintf(errBuf, errMax, "%s: Couldn't allocate memory for the device string!", __func__);
-		free(context);
-		return DAQ_ERROR_NOMEM;
-	}
 
-	context->snaplen = cfg->snaplen;
-	context->promisc_flag = (cfg->flags & DAQ_CFG_PROMISC);
-	context->timeout = cfg->timeout;
-	INIT_LIST_HEAD(&context->blacklist);
-
-	if (pcap_daq_open(context, MONDEV_NAME, &context->mon_handle) != DAQ_SUCCESS) {
+	fprintf(stderr, "OPEN1!!!!!!!!!!!!!\n");
+	fprintf(stderr, "CONFIG %s\n", cfg->name);
+	rswitch_handle->mon_context.stop = 1;
+	rswitch_handle->mon_context.device = strdup(MONDEV_NAME);
+	rswitch_handle->mon_context.snaplen = cfg->snaplen;
+	rswitch_handle->mon_context.promisc_flag = (cfg->flags & DAQ_CFG_PROMISC);
+	rswitch_handle->mon_context.timeout = cfg->timeout;
+	rswitch_handle->mon_context.state = DAQ_STATE_INITIALIZED;
+	rswitch_handle->mon_context.callback = pcap_process_mon_loop;
+	pthread_create(&rswitch_handle->mon_context.thread, NULL, acquire_loop, &rswitch_handle->mon_context);
+	if (pcap_daq_open(&rswitch_handle->mon_context, MONDEV_NAME) != DAQ_SUCCESS) {
 		snprintf(errBuf, errMax, "%s", context->error);
-		free(context);
+		free(rswitch_handle);
 		return DAQ_ERROR;
 	}
 
-	if (pcap_daq_open(context, context->device, &context->handle) != DAQ_SUCCESS) {
-		snprintf(errBuf, errMax, "%s", context->error);
-		free(context);
-		return DAQ_ERROR;
+	fprintf(stderr, "OPEN1!!!!!!!!!!!!!\n");
+	devname = strtok(cfg->name, ":");
+	while (devname) {
+		fprintf(stderr, "OPENING %s\n",devname);
+		context = &rswitch_handle->contexts[i];
+		context->stop = 1;
+		pthread_create(&context->thread, NULL, acquire_loop, context);
+		context->device = strdup(devname);
+		if (!context->device) {
+			snprintf(errBuf, errMax, "%s: Couldn't allocate memory for the device string!", __func__);
+			free(context);
+			return DAQ_ERROR_NOMEM;
+		}
+
+		context->snaplen = cfg->snaplen;
+		context->promisc_flag = (cfg->flags & DAQ_CFG_PROMISC);
+		context->timeout = cfg->timeout;
+		INIT_LIST_HEAD(&context->blacklist);
+
+		if (pcap_daq_open(context, context->device) != DAQ_SUCCESS) {
+			snprintf(errBuf, errMax, "%s", context->error);
+			free(context);
+			return DAQ_ERROR;
+		}
+		context->callback = pcap_process_loop;
+		context->state = DAQ_STATE_INITIALIZED;
+		get_eth_addr(context->device, context->ether_addr);
+		// print mac address
+		fprintf(stderr, "MAC %s %02x:%02x:%02x:%02x:%02x:%02x\n", context->device,
+			context->ether_addr[0], context->ether_addr[1], context->ether_addr[2],
+			context->ether_addr[3], context->ether_addr[4], context->ether_addr[5]);
+
+		i++;
+		devname = strtok(NULL, ":");
 	}
+
 
 	if (rtnl_open(&rth, 0) < 0) {
 		fprintf(stderr, "Cannot open rtnetlink\n");
@@ -1346,9 +1501,8 @@ static int rswitch_daq_initialize(
 		return DAQ_ERROR;
 	}
 
-	context->state = DAQ_STATE_INITIALIZED;
 
-	*handle = context;
+	*handle = rswitch_handle;
 
 	return DAQ_SUCCESS;
 }
@@ -1378,11 +1532,19 @@ static void remove_drop_action(struct rswitch_context *context, uint32_t pref)
 
 static void rswitch_daq_shutdown(void *handle)
 {
-	struct rswitch_context *context = (struct rswitch_context *)handle;
+	struct rswitch_handle *rswitch_handle = (struct rswitch_handle *)handle;
 	struct blacklist_data *pos, *tmp;
+	int i;
+	L;
 
-	list_for_each_entry_safe(pos, tmp, &context->blacklist, list)
-		remove_drop_action(context, pos->pref);
+	fprintf(stderr, "SHUTDOWN!!!!!!!! \n");
+	for (i = 0; i < TSN_NUM; i++) {
+		struct rswitch_context *context = &rswitch_handle->contexts[i];
+		if (!context->handle)
+			continue;
+		list_for_each_entry_safe(pos, tmp, &context->blacklist, list)
+			remove_drop_action(context, pos->pref);
+	}
 }
 
 static void add_drop_action(struct nlmsghdr	*n)
@@ -1628,64 +1790,50 @@ static void blacklist_traffic(struct ip_v4_hdr *ip_hdr, struct rswitch_context *
 	list_add(&blacklist_entry->list, &context->blacklist);
 }
 
-static void pcap_process_loop(u_char *user, const struct pcap_pkthdr *pkth, const u_char *data)
-{
-	struct rswitch_context *context = (struct rswitch_context *) user;
-	DAQ_PktHdr_t hdr = { 0 };
-	DAQ_Verdict verdict;
-	struct ip_v4_hdr *ip_hdr;
-
-	hdr.caplen = pkth->caplen;
-	hdr.pktlen = pkth->len;
-	hdr.ts = pkth->ts;
-	hdr.ingress_index = -1;
-	hdr.egress_index = -1;
-	hdr.ingress_group = -1;
-	hdr.egress_group = -1;
-	hdr.flags = 0;
-	hdr.address_space_id = 0;
-	ip_hdr = (struct ip_v4_hdr *)data;
-
-	/* Increment the current acquire loop's packet counter. */
-	context->packets++;
-	/* ...and then the module instance's packet counter. */
-	context->stats.packets_received++;
-	verdict = context->analysis_func(context->user_data, &hdr, data);
-
-	if (verdict >= MAX_DAQ_VERDICT)
-		verdict = DAQ_VERDICT_PASS;
-	if (verdict == DAQ_VERDICT_BLACKLIST)
-		blacklist_traffic(ip_hdr, context);
-	context->stats.verdicts[verdict]++;
-}
-
 static int rswitch_daq_acquire(
 	void* handle, int cnt, DAQ_Analysis_Func_t callback, DAQ_Meta_Func_t metaback, void* user)
 {
-	struct rswitch_context *context = (struct rswitch_context *)handle;
+	struct rswitch_handle *rswitch_handle = (struct rswitch_handle *)handle;
+	struct rswitch_context *context;
 	int ret;
+	int i;
 
-	context->analysis_func = callback;
-	context->user_data = user;
+	L;
+	rswitch_handle->mon_context.analysis_func = callback;
+	rswitch_handle->mon_context.user_data = user;
+	rswitch_handle->mon_context.packets = 0;
+	rswitch_handle->mon_context.cnt = cnt;
+	rswitch_handle->mon_context.stop = 0;
+	for (i = 0; i < TSN_NUM; i++) {
+		context = &rswitch_handle->contexts[i];
 
-	context->packets = 0;
-	while (context->packets < cnt || cnt <= 0) {
-		ret = pcap_dispatch(
-			context->handle, (cnt <= 0) ? -1 : cnt - context->packets, pcap_process_loop, (void *)context);
-		if (ret == -1) {
-			DPE(context->error, "%s", pcap_geterr(context->handle));
-			return ret;
+		if (!context->handle) {
+			continue;
 		}
-		ret = pcap_dispatch(
-			context->mon_handle, (cnt <= 0) ? -1 : cnt - context->packets, pcap_process_loop, (void *)context);
-		if (ret == -1) {
-			DPE(context->error, "%s", pcap_geterr(context->mon_handle));
-			return ret;
-		}
-		/* If we hit a breakloop call or timed out without reading any packets, break out. */
-		else if (ret == -2 || ret == 0)
-			break;
+
+		context->analysis_func = callback;
+		context->user_data = user;
+		context->packets = 0;
+		context->cnt = cnt;
+		context->stop = 0;
 	}
+
+	L;
+	for (i = 0; i < TSN_NUM; i++) {
+		context = &rswitch_handle->contexts[i];
+		if (!context->handle) {
+			continue;
+		}
+
+		fprintf(stderr, "Join %s\n", context->device);
+		pthread_join(context->thread, NULL);
+	L;
+	}
+
+	L;
+	fprintf(stderr, "Join %s\n", rswitch_handle->mon_context.device);
+	pthread_join(rswitch_handle->mon_context.thread, NULL);
+	L;
 
 	return 0;
 }
@@ -1694,51 +1842,72 @@ static int rswitch_daq_inject(
 	void* handle, const DAQ_PktHdr_t* hdr, const uint8_t* buf, uint32_t len,
 	int reverse)
 {
+	L;
 	return DAQ_SUCCESS;
 }
 
 static int rswitch_daq_set_filter(void* handle, const char* filter)
 {
+	L;
 	return DAQ_SUCCESS;
 }
 
 static int rswitch_daq_start(void* handle)
 {
-	struct rswitch_context *context = (struct rswitch_context *)handle;
+	struct rswitch_handle *rswitch_handle = (struct rswitch_handle *)handle;
 
-	if (pcap_daq_open(context, context->device, &context->handle) != DAQ_SUCCESS)
-		return DAQ_ERROR;
-
-	context->state = DAQ_STATE_STARTED;
+	L;
+	rswitch_handle->contexts[0].state = DAQ_STATE_STARTED;
 	return DAQ_SUCCESS;
 }
 
 static int rswitch_daq_breakloop(void* handle)
 {
+	L;
 	return DAQ_SUCCESS;
 }
 
 static int rswitch_daq_stop(void* handle)
 {
-	struct rswitch_context *context = (struct rswitch_context *)handle;
+	struct rswitch_handle *rswitch_handle = (struct rswitch_handle *)handle;
+	struct rswitch_context *context;
+	int i;
 
-	pcap_breakloop(context->handle);
-	pcap_breakloop(context->mon_handle);
-	pcap_close(context->handle);
-	pcap_close(context->mon_handle);
-	context->state = DAQ_STATE_STOPPED;
+	L;
+	fprintf(stderr, "Stopping all contexts\n");
+	for (i = 0; i < TSN_NUM; i++) {
+		context = &rswitch_handle->contexts[i];
+		if (!context->handle)
+			continue;
+		fprintf(stderr, "Stopping context %s\n", context->device);
+		context->stop = 1;
+		pcap_breakloop(context->handle);
+		pcap_close(context->handle);
+		pcap_breakloop(context->handle);
+		fprintf(stderr, "Canceling  context %s\n", context->device);
+		//pthread_cancel(context->thread);
+		context->state = DAQ_STATE_STOPPED;
+	}
+	fprintf(stderr, "Stopping context %s\n", rswitch_handle->mon_context.device);
+	rswitch_handle->mon_context.stop = 1;
+	pcap_breakloop(rswitch_handle->mon_context.handle);
+	pcap_close(rswitch_handle->mon_context.handle);
+	pcap_breakloop(rswitch_handle->mon_context.handle);
+	fprintf(stderr, "Canceling  context %s\n", rswitch_handle->mon_context.device);
+	//pthread_cancel(rswitch_handle->mon_context.thread);
 	return DAQ_SUCCESS;
 }
 
 static DAQ_State rswitch_daq_check_status(void* handle)
 {
-	struct rswitch_context *context = (struct rswitch_context *)handle;
-
-	return context->state;
+	struct rswitch_handle *rswitch_handle = (struct rswitch_handle *)handle;
+	L;
+	return rswitch_handle->contexts[0].state;
 }
 
 static int rswitch_daq_get_stats(void* handle, DAQ_Stats_t* stats)
 {
+	L;
 	return DAQ_SUCCESS;
 }
 
@@ -1746,35 +1915,42 @@ static void rswitch_daq_reset_stats(void* handle) { }
 
 static int rswitch_daq_get_snaplen (void* handle)
 {
+	L;
 	return 0;
 }
 
 static uint32_t rswitch_daq_get_capabilities(void* handle)
 {
+	L;
 	return DAQ_CAPA_BLOCK | DAQ_CAPA_BREAKLOOP |
 		DAQ_CAPA_UNPRIV_START | DAQ_CAPA_BLACKLIST;
 }
 
 static int rswitch_daq_get_datalink_type(void *handle)
 {
+	L;
 	return DLT_EN10MB;
 }
 
 static const char* rswitch_daq_get_errbuf(void* handle)
 {
-	struct rswitch_context *context = (struct rswitch_context *)handle;
+	struct rswitch_handle *rswitch_handle = (struct rswitch_handle *)handle;
+	L;
 
-	return context->error;
+	return rswitch_handle->contexts[0].error;
 }
 
 static void rswitch_daq_set_errbuf(void* handle, const char* s)
 {
-	struct rswitch_context *context = (struct rswitch_context *)handle;
-	DPE(context->error, "%s", s ? s : "");
+	struct rswitch_handle *rswitch_handle = (struct rswitch_handle *)handle;
+	L;
+
+	DPE(rswitch_handle->contexts[0].error, "%s", s ? s : "");
 }
 
 static int rswitch_daq_get_device_index(void* handle, const char* device)
 {
+	L;
 	return DAQ_ERROR_NOTSUP;
 }
 
